@@ -1,32 +1,41 @@
 """Machine learning functions"""
 from pickle import load
 import requests
+import os
+import datetime
 from bs4 import BeautifulSoup as bs
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from app.state_abbr import us_state_abbrev as abbr
+from dotenv import dotenv_values, load_dotenv
 from pathlib import Path
 import pandas as pd
+import numpy as np
 from pypika import Query, Table, CustomFunction
 import asyncio
 from app.db import database, select, select_all
 from typing import List, Optional
-
+import json
+from dotenv import dotenv_values, load_dotenv
+import os
 
 router = APIRouter()
+load_dotenv()
 
-
-class City(BaseModel):
+class City(BaseModel): #Class definition for City objects
     city: str = "New York"
-    state: str = "NY"
+    state: str = "NY" #Values used as defaults in the FastAPI interface
 
+class CityJobs(BaseModel): 
+    city: City
+    position: str = "Data Scientist"
 
 class CityRecommendations(BaseModel):
     recommendations: List[City]
 
 
-class CityDataBase(BaseModel):
-    city: City
+class CityDataBase(BaseModel): #Parent Class definition for 
+    city: City # Class object that contains city.city and city.state for each location (city/state pair)
     latitude: float
     longitude: float
     rental_price: float
@@ -36,19 +45,22 @@ class CityDataBase(BaseModel):
     diversity_index: float
 
 
-class CityData(CityDataBase):
-    walkability: float
-    livability: float
-    recommendations: List[City]
+class CityData(CityDataBase): # Child class with additional data to be added to the main city data
+    walkability: float  # Live scraped from WalkScore.com
+    busability: float   # Live scraped from WalkScore.com
+    bikeability: float   # Live scraped from WalkScore.com
+    livability: float   # calculated from livability model 
+    recommendations: List[City] # calculated from Nearest Neighbors model and 
+                                # stored in the df "notebooks/datasets/datasets_to_merge/updated/final.csv"
 
 
-class CityDataFull(CityDataBase):
+class CityDataFull(CityDataBase):  # Child class with additional data to be added to the main city data
     good_days: int
     crime_rate_ppt: float
     nearest_string: str
 
 
-class LivabilityWeights(BaseModel):
+class LivabilityWeights(BaseModel): # Default weights for livability model
     walkability: float = 1.0
     low_rent: float = 1.0
     low_pollution: float = 1.0
@@ -84,7 +96,7 @@ def validate_city(
         else:
             city.state = city.state.upper()
     except KeyError:
-        raise HTTPException(status_code=422, detail=f"Unknown state: '{city.state}'")
+        raise HTTPException(status_code=422, detail=f"Unknown Location: '{city.state}'")
 
     return city
 
@@ -112,6 +124,8 @@ async def get_data(city: City):
     tasks = await asyncio.gather(
         get_livability_score(city, full_data),
         get_walkability(city),
+        get_busability(city),
+        get_bikeability(city),
         get_recommendation_cities(city, full_data.nearest_string),
     )
     data = {**full_data.dict()}
@@ -218,8 +232,51 @@ async def get_walkability(city: City):
     return {"walkability": score}
 
 
+@router.post("/api/busability")
+async def get_busability(city: City):
+    """Retrieve BusScore for target city
+
+    args:
+        city: The target city
+
+    returns:
+        Dictionary that contains the Bus Score, which is converted
+        by fastAPI to a json object.
+    """
+    city = validate_city(city)
+    try:
+        score = (await get_walkscore(**city.dict()))[1]
+    except IndexError:
+        raise HTTPException(
+            status_code=422, detail=f"BusScore not found for {city.city}, {city.state}"
+        )
+
+    return {"busability": score}
+
+    
+@router.post("/api/bikeability")
+async def get_bikeability(city: City):
+    """Retrieve bikeScore for target city
+
+    args:
+        city: The target city
+
+    returns:
+        Dictionary that contains the BikeScore, which is converted
+        by fastAPI to a json object.
+    """
+    city = validate_city(city)
+    try:
+        score = (await get_walkscore(**city.dict()))[2]
+    except IndexError:
+        raise HTTPException(
+            status_code=422, detail=f"BikeScore not found for {city.city}, {city.state}"
+        )
+
+    return {"bikeability": score}
+
 async def get_walkscore(city: str, state: str):
-    """Scrape Walkscore.
+    """Scrape Walkscore, BusScore, and BikeScore.
 
     args:
         city: The target city
@@ -355,6 +412,41 @@ async def get_recommendations(city: City):
     return recommendations
 
 
+@router.post("/api/traffic_data")
+async def get_traffic(city: City):
+    """Retrieve recommended cities for target city
+
+    Fetch data from dataframe
+
+    args:
+        city: The target city
+
+    returns:
+        Dictionary that contains the requested data, which is converted
+            by fastAPI to a json object.
+    """
+
+    
+    # reading traffic dataframe into function 
+    df = pd.read_csv("https://raw.githubusercontent.com/Lambda-School-Labs/PT17_cityspire-d-ds/main/app/city_traffic.csv")
+    
+    # locate the exact row by city and state
+    value = df.loc[((df["city"] == city.city) & (df["state"] == city.state))]
+    # transform data row to numpy array 
+    value = value.to_numpy()
+    # if the values are out of index then they dont exist
+    try: 
+        response = {"city" : value[0][0], "state" : value[0][1], "world_rank" : value[0][2], "avg_congestion" : value[0][3], 
+                    "am_peak": value[0][4], "pm_peak": value[0][5],   "worst_day" : value[0][6]}
+    # if it doesnt exist, raise exception
+    except IndexError:
+        raise HTTPException(
+            status_code=422, detail=f"Traffic data not found for {city.city}, {city.state}"
+            )
+    # otherwise return response
+    return response
+    
+
 async def get_recommendation_cities(city: City, nearest_string: str):
     """Use the string and transform to City
 
@@ -387,3 +479,175 @@ async def get_recommendation_cities(city: City, nearest_string: str):
     )
 
     return recs
+
+# weather API routes
+
+load_dotenv()
+API_KEY = os.getenv('PROJECT_API_KEY')
+
+
+@router.post('/api/get_current_temp')
+async def get_current_temp(city: City):
+
+    city = validate_city(city)
+    value = await select(["lat", "lon"], city)
+    #temp_weather = json.loads(get_coordinates(city))
+    
+    url = "https://api.openweathermap.org/data/2.5/weather?lat=%s&lon=%s&appid=%s&units=imperial" % (value[0], value[1], API_KEY)
+    response = requests.get(url)
+    data = json.loads(response.text)
+
+    return data["main"]["temp"]
+    pass
+
+@router.post('/api/get_feels_like')
+async def get_feels_like_temp(city: City):
+
+    city = validate_city(city)
+    value = await select(["lat", "lon"], city)
+    
+    url = "https://api.openweathermap.org/data/2.5/weather?lat=%s&lon=%s&appid=%s&units=imperial" % (value[0], value[1], API_KEY)
+    response = requests.get(url)
+    data = json.loads(response.text)
+   
+    return data["main"]["feels_like"]
+    pass
+
+@router.post('/api/get_temp_min')
+async def get_min_temp(city: City):
+
+    city = validate_city(city)
+    value = await select(["lat", "lon"], city)
+    
+    url = "https://api.openweathermap.org/data/2.5/weather?lat=%s&lon=%s&appid=%s&units=imperial" % (value[0], value[1], API_KEY)
+    response = requests.get(url)
+    data = json.loads(response.text)
+    return data["main"]["temp_min"]
+    pass
+
+@router.post('/api/get_temp_max')
+async def get_max_temp(city: City):
+
+    city = validate_city(city)
+    value = await select(["lat", "lon"], city)
+    
+    url = "https://api.openweathermap.org/data/2.5/weather?lat=%s&lon=%s&appid=%s&units=imperial" % (value[0], value[1], API_KEY)
+    response = requests.get(url)
+    data = json.loads(response.text)
+
+    return data["main"]["temp_max"]
+    pass
+
+@router.post('/api/get_humidity')
+async def get_humidity(city: City):
+
+    city = validate_city(city)
+    value = await select(["lat", "lon"], city)
+    
+    url = "https://api.openweathermap.org/data/2.5/weather?lat=%s&lon=%s&appid=%s&units=imperial" % (value[0], value[1], API_KEY)
+    response = requests.get(url)
+    data = json.loads(response.text)
+
+    return data["main"]["humidity"]
+    pass
+
+@router.post('/api/get_weather_all')
+async def get_weather_all(city: City):
+
+    city = validate_city(city)
+    value = await select(["lat", "lon"], city)
+    
+    url = "https://api.openweathermap.org/data/2.5/weather?lat=%s&lon=%s&appid=%s&units=imperial" % (value[0], value[1], API_KEY)
+    response = requests.get(url)
+    data = json.loads(response.text)
+
+    return data
+    pass
+
+# This approach was origianllly developed by https://github.com/israel-dryer/Indeed-Job-Scraper/blob/master/indeed-tutorial.ipynb
+# Also credit https://github.com/jiobu1 for help finding approaches to turning this into an API end point
+# https://www.youtube.com/watch?v=eN_3d4JrL_w
+# https://medium.com/@hannah15198/convert-csv-to-json-with-python-b8899c722f6d
+@router.post('/api/job_opportunities')
+async def job_opportunities(cityjobs:CityJobs):
+    """Returns jobs opportunities from indeed.com
+
+    Fetch first 10 job opportunities
+    - Job title,
+    - Company,
+    - Job location
+    - Post Date,
+    - Extraction Date,
+    - Job Description,
+    - Salary,
+    - Job Url
+    
+    args:
+        - position: desired job
+        - city: target city
+    returns:
+        Dictionary of requested data in a JSON object
+    """
+
+
+    records = []  
+
+    city_name = validate_city(cityjobs.city)
+    position = cityjobs.position
+    location = city_name.city + ' ' + city_name.state
+    url = get_url(position, location) 
+
+    response = requests.get(url)
+    soup = bs(response.text, 'html.parser')
+    cards = soup.find_all('div', 'jobsearch-SerpJobCard')
+
+    for card in cards:
+        record = get_record(card)
+        records.append(record)
+
+    #return total number of jobs by queary and city, state
+    try:
+        total_jobs = soup.find('div', id='searchCountPages').text.strip()
+        total = total_jobs.split()[-2:]
+        jobs = ' '.join(total)
+    except AttributeError:
+        total_jobs = ''
+        jobs = ''
+
+    return {"Search Results":jobs, "Top 15 Listings": records}
+
+def get_record(card):
+    # credit to https://github.com/jiobu1 
+    """Extract job data from a single record"""
+    atag = card.h2.a
+    job_title = atag.get('title')
+    company = card.find('span', 'company').text.strip()
+    job_location = card.find('div', 'recJobLoc').get('data-rc-loc')
+    job_summary = card.find('div', 'summary').text.strip()
+    post_date = card.find('span', 'date').text.strip()
+
+    try:
+        salary = card.find('span', 'salarytext').text.strip()
+    except AttributeError:
+        salary = ''
+
+    extract_date = datetime.datetime.today().strftime('%Y-%m-%d')
+    job_url = 'https://www.indeed.com' + atag.get('href')
+
+    record = {'Job Title': job_title,
+              'Company': company,
+              'Location': job_location,
+              'Date Posted': post_date,
+              'Extract Date': extract_date,
+              'Description': job_summary,
+              'Salary': salary,
+              'Job Url': job_url}
+
+    return record
+
+def get_url(position, location):
+    "Generate a url based on position and location"
+
+    template = "https://www.indeed.com/jobs?q={}&l={}"
+    url = template.format(position, location)
+    return url
